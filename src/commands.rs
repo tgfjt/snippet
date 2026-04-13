@@ -9,10 +9,8 @@ use crate::store;
 
 // ─── search ──────────────────────────────────────────────
 
-pub fn search(query: Option<&str>, full: bool) -> Result<(), String> {
-    let snippets = store::load_snippets()?;
-
-    let matches: Vec<&Snippet> = match query {
+pub fn filter_snippets<'a>(snippets: &'a [Snippet], query: Option<&str>) -> Vec<&'a Snippet> {
+    match query {
         Some(q) => {
             let q = q.to_lowercase();
             snippets
@@ -22,18 +20,24 @@ pub fn search(query: Option<&str>, full: bool) -> Result<(), String> {
                         || s.description.to_lowercase().contains(&q)
                         || s.tags
                             .as_ref()
-                            .map_or(false, |tags| tags.iter().any(|t| t.to_lowercase().contains(&q)))
+                            .is_some_and(|tags| tags.iter().any(|t| t.to_lowercase().contains(&q)))
                         || s.command
                             .as_ref()
-                            .map_or(false, |c| c.to_lowercase().contains(&q))
+                            .is_some_and(|c| c.to_lowercase().contains(&q))
                         || s.body
                             .as_ref()
-                            .map_or(false, |b| b.to_lowercase().contains(&q))
+                            .is_some_and(|b| b.to_lowercase().contains(&q))
                 })
                 .collect()
         }
         None => snippets.iter().collect(),
-    };
+    }
+}
+
+pub fn search(query: Option<&str>, full: bool) -> Result<(), String> {
+    let snippets = store::load_snippets()?;
+
+    let matches = filter_snippets(&snippets, query);
 
     if matches.is_empty() {
         if query.is_some() {
@@ -76,8 +80,8 @@ pub fn get(name: &str) -> Result<(), String> {
 
     match snippets.iter().find(|s| s.name == name) {
         Some(s) => {
-            let yaml = serde_yaml::to_string(&vec![s])
-                .map_err(|e| format!("YAML出力に失敗: {}", e))?;
+            let yaml =
+                serde_yaml::to_string(&vec![s]).map_err(|e| format!("YAML出力に失敗: {}", e))?;
             print!("{}", yaml);
             Ok(())
         }
@@ -176,7 +180,7 @@ fn read_body() -> Result<Option<String>, String> {
     }
 
     // 末尾の空行を除去
-    while lines.last().map_or(false, |l| l.is_empty()) {
+    while lines.last().is_some_and(|l| l.is_empty()) {
         lines.pop();
     }
 
@@ -345,14 +349,12 @@ pub fn edit(name: &str) -> Result<(), String> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
 
     // エントリだけを一時ファイルに切り出す
-    let yaml =
-        serde_yaml::to_string(&snippets.iter().find(|s| s.name == name).unwrap())
-            .map_err(|e| format!("YAML変換に失敗: {}", e))?;
+    let yaml = serde_yaml::to_string(&snippets.iter().find(|s| s.name == name).unwrap())
+        .map_err(|e| format!("YAML変換に失敗: {}", e))?;
 
     let tmp_dir = std::env::temp_dir();
     let tmp_path = tmp_dir.join(format!("snippet-{}.yml", name));
-    std::fs::write(&tmp_path, &yaml)
-        .map_err(|e| format!("一時ファイルの作成に失敗: {}", e))?;
+    std::fs::write(&tmp_path, &yaml).map_err(|e| format!("一時ファイルの作成に失敗: {}", e))?;
 
     let status = Command::new(&editor)
         .arg(&tmp_path)
@@ -372,13 +374,8 @@ pub fn edit(name: &str) -> Result<(), String> {
         serde_yaml::from_str(&edited).map_err(|e| format!("編集後のYAMLパースに失敗: {}", e))?;
 
     // name の変更で重複しないかチェック
-    if edited_snippet.name != name
-        && snippets.iter().any(|s| s.name == edited_snippet.name)
-    {
-        return Err(format!(
-            "name が重複しています: {}",
-            edited_snippet.name
-        ));
+    if edited_snippet.name != name && snippets.iter().any(|s| s.name == edited_snippet.name) {
+        return Err(format!("name が重複しています: {}", edited_snippet.name));
     }
 
     // 全エントリを再構築して書き出す（コメントは失われる）
@@ -393,8 +390,8 @@ pub fn edit(name: &str) -> Result<(), String> {
         })
         .collect();
 
-    let yaml = serde_yaml::to_string(&new_snippets)
-        .map_err(|e| format!("YAML変換に失敗: {}", e))?;
+    let yaml =
+        serde_yaml::to_string(&new_snippets).map_err(|e| format!("YAML変換に失敗: {}", e))?;
     std::fs::write(store::snippets_path(), yaml)
         .map_err(|e| format!("ファイルの書き込みに失敗: {}", e))?;
 
@@ -406,33 +403,208 @@ pub fn edit(name: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn make_snippet(name: &str, desc: &str) -> Snippet {
+        Snippet {
+            name: name.to_string(),
+            description: desc.to_string(),
+            command: None,
+            tags: None,
+            body: None,
+        }
+    }
+
+    fn make_snippet_full(
+        name: &str,
+        desc: &str,
+        command: Option<&str>,
+        tags: &[&str],
+        body: Option<&str>,
+    ) -> Snippet {
+        Snippet {
+            name: name.to_string(),
+            description: desc.to_string(),
+            command: command.map(|s| s.to_string()),
+            tags: if tags.is_empty() {
+                None
+            } else {
+                Some(tags.iter().map(|s| s.to_string()).collect())
+            },
+            body: body.map(|s| s.to_string()),
+        }
+    }
+
+    // ─── プレースホルダのパース ──────────────────────────
+
     #[test]
-    fn test_parse_placeholders_simple() {
-        let result = parse_placeholders("ffmpeg -i {{input}} -o {{output}}");
-        assert_eq!(result, vec![
-            ("input".to_string(), None),
-            ("output".to_string(), None),
-        ]);
+    fn 複数のプレースホルダを出現順に抽出する() {
+        // Arrange
+        let command = "ffmpeg -i {{input}} -o {{output}}";
+
+        // Act
+        let result = parse_placeholders(command);
+
+        // Assert
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], ("input".to_string(), None));
+        assert_eq!(result[1], ("output".to_string(), None));
     }
 
     #[test]
-    fn test_parse_placeholders_with_defaults() {
-        let result = parse_placeholders("convert -quality {{quality:80}} {{input}}");
-        assert_eq!(result, vec![
-            ("quality".to_string(), Some("80".to_string())),
-            ("input".to_string(), None),
-        ]);
+    fn デフォルト値つきプレースホルダを名前と値に分離する() {
+        // Arrange
+        let command = "convert -quality {{quality:80}} {{input}}";
+
+        // Act
+        let result = parse_placeholders(command);
+
+        // Assert
+        assert_eq!(result[0], ("quality".to_string(), Some("80".to_string())));
+        assert_eq!(result[1], ("input".to_string(), None));
     }
 
     #[test]
-    fn test_parse_placeholders_dedup() {
-        let result = parse_placeholders("cp {{file}} /tmp/{{file}}");
-        assert_eq!(result, vec![("file".to_string(), None)]);
+    fn 同名プレースホルダは最初の1つだけ残る() {
+        // Arrange
+        let command = "cp {{file}} /backup/{{file}}";
+
+        // Act
+        let result = parse_placeholders(command);
+
+        // Assert
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, "file");
     }
 
     #[test]
-    fn test_parse_placeholders_empty() {
-        let result = parse_placeholders("echo hello");
+    fn プレースホルダがなければ空を返す() {
+        // Arrange
+        let command = "echo hello world";
+
+        // Act
+        let result = parse_placeholders(command);
+
+        // Assert
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn 閉じ括弧がないプレースホルダは無視する() {
+        // Arrange
+        let command = "echo {{broken";
+
+        // Act
+        let result = parse_placeholders(command);
+
+        // Assert
+        assert!(result.is_empty());
+    }
+
+    // ─── 検索フィルタリング ─────────────────────────────
+
+    #[test]
+    fn クエリなしで全件返る() {
+        // Arrange
+        let snippets = vec![make_snippet("a", "first"), make_snippet("b", "second")];
+
+        // Act
+        let results = filter_snippets(&snippets, None);
+
+        // Assert
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn 名前に部分一致する() {
+        // Arrange
+        let snippets = vec![
+            make_snippet("loudnorm", "normalize audio"),
+            make_snippet("resize", "resize image"),
+        ];
+
+        // Act
+        let results = filter_snippets(&snippets, Some("loud"));
+
+        // Assert
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "loudnorm");
+    }
+
+    #[test]
+    fn 検索は大文字小文字を区別しない() {
+        // Arrange
+        let snippets = vec![make_snippet("FFmpeg-encode", "Encode video")];
+
+        // Act
+        let results = filter_snippets(&snippets, Some("ffmpeg"));
+
+        // Assert
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn タグにもマッチする() {
+        // Arrange
+        let snippets = vec![make_snippet_full(
+            "deploy",
+            "deploy to prod",
+            None,
+            &["aws", "prod"],
+            None,
+        )];
+
+        // Act
+        let results = filter_snippets(&snippets, Some("aws"));
+
+        // Assert
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "deploy");
+    }
+
+    #[test]
+    fn コマンド文字列にもマッチする() {
+        // Arrange
+        let snippets = vec![make_snippet_full(
+            "enc",
+            "encode",
+            Some("ffmpeg -i {{input}}"),
+            &[],
+            None,
+        )];
+
+        // Act
+        let results = filter_snippets(&snippets, Some("ffmpeg"));
+
+        // Assert
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn ボディにもマッチする() {
+        // Arrange
+        let snippets = vec![make_snippet_full(
+            "setup",
+            "setup steps",
+            None,
+            &[],
+            Some("run docker compose up"),
+        )];
+
+        // Act
+        let results = filter_snippets(&snippets, Some("docker"));
+
+        // Assert
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn マッチしなければ空を返す() {
+        // Arrange
+        let snippets = vec![make_snippet("hello", "world")];
+
+        // Act
+        let results = filter_snippets(&snippets, Some("zzz"));
+
+        // Assert
+        assert!(results.is_empty());
     }
 }

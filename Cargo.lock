@@ -470,6 +470,7 @@ dependencies = [
  "dirs",
  "serde",
  "serde_yaml",
+ "tempfile",
 ]
 
 [[package]]
