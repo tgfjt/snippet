@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo fmt --quiet 2>/dev/null; cargo clippy --quiet --message-format=short 2>&1 | head -20",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
