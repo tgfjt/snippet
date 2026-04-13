@@ -60,11 +60,9 @@ pub fn append_snippet_to(snippet: &Snippet, path: &Path) -> Result<(), String> {
     if let Some(ref cmd) = snippet.command {
         content.push_str(&format!("  command: {}\n", yaml_scalar(cmd)));
     }
-    if let Some(ref tags) = snippet.tags {
-        if !tags.is_empty() {
-            let items: Vec<String> = tags.iter().map(|t| yaml_scalar(t)).collect();
-            content.push_str(&format!("  tags: [{}]\n", items.join(", ")));
-        }
+    if !snippet.tags.is_empty() {
+        let items: Vec<String> = snippet.tags.iter().map(|t| yaml_scalar(t)).collect();
+        content.push_str(&format!("  tags: [{}]\n", items.join(", ")));
     }
     if let Some(ref body) = snippet.body {
         content.push_str("  body: |\n");
@@ -83,7 +81,15 @@ pub fn append_snippet_to(snippet: &Snippet, path: &Path) -> Result<(), String> {
 
 /// YAML スカラー値として安全にフォーマットする
 pub(crate) fn yaml_scalar(s: &str) -> String {
-    if s.is_empty()
+    if needs_quoting(s) {
+        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        s.to_string()
+    }
+}
+
+fn needs_quoting(s: &str) -> bool {
+    s.is_empty()
         || s.contains(':')
         || s.contains('#')
         || s.contains('{')
@@ -105,16 +111,19 @@ pub(crate) fn yaml_scalar(s: &str) -> String {
         || s.starts_with('`')
         || s.starts_with(',')
         || s.starts_with('?')
-        || s == "true"
-        || s == "false"
-        || s == "null"
-        || s == "yes"
-        || s == "no"
-    {
-        format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-    } else {
-        s.to_string()
-    }
+        || matches!(s, "true" | "false" | "null" | "yes" | "no")
+        || looks_numeric(s)
+}
+
+/// YAML パーサが数値として解釈しうる文字列を検出する
+fn looks_numeric(s: &str) -> bool {
+    // 整数、浮動小数点、八進、十六進、無限大、NaN
+    s.parse::<f64>().is_ok()
+        || s.starts_with("0x")
+        || s.starts_with("0o")
+        || s.eq_ignore_ascii_case(".inf")
+        || s.eq_ignore_ascii_case("-.inf")
+        || s.eq_ignore_ascii_case(".nan")
 }
 
 #[cfg(test)]
@@ -122,36 +131,6 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::NamedTempFile;
-
-    fn make_snippet(name: &str, desc: &str) -> Snippet {
-        Snippet {
-            name: name.to_string(),
-            description: desc.to_string(),
-            command: None,
-            tags: None,
-            body: None,
-        }
-    }
-
-    fn make_snippet_full(
-        name: &str,
-        desc: &str,
-        command: Option<&str>,
-        tags: &[&str],
-        body: Option<&str>,
-    ) -> Snippet {
-        Snippet {
-            name: name.to_string(),
-            description: desc.to_string(),
-            command: command.map(|s| s.to_string()),
-            tags: if tags.is_empty() {
-                None
-            } else {
-                Some(tags.iter().map(|s| s.to_string()).collect())
-            },
-            body: body.map(|s| s.to_string()),
-        }
-    }
 
     // ─── yaml_scalar 契約テスト ──────────────────────────
 
@@ -230,6 +209,20 @@ mod tests {
         assert_eq!(result, r#""say \"hello\"""#);
     }
 
+    #[test]
+    fn 数値文字列はクォートされる() {
+        // Arrange / Act / Assert
+        for s in &["123", "3.14", "0xFF", "0o77", ".inf", ".nan"] {
+            let result = yaml_scalar(s);
+            assert!(
+                result.starts_with('"'),
+                "{} がクォートされていない: {}",
+                s,
+                result
+            );
+        }
+    }
+
     // ─── 往復テスト ─────────────────────────────────────
 
     #[test]
@@ -237,7 +230,7 @@ mod tests {
         // Arrange
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
-        let snippet = make_snippet("memo", "ただのメモ");
+        let snippet = Snippet::minimal("memo", "ただのメモ");
 
         // Act
         append_snippet_to(&snippet, path).unwrap();
@@ -248,7 +241,7 @@ mod tests {
         assert_eq!(loaded[0].name, "memo");
         assert_eq!(loaded[0].description, "ただのメモ");
         assert!(loaded[0].command.is_none());
-        assert!(loaded[0].tags.is_none());
+        assert!(loaded[0].tags.is_empty());
         assert!(loaded[0].body.is_none());
     }
 
@@ -257,7 +250,7 @@ mod tests {
         // Arrange
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
-        let snippet = make_snippet_full(
+        let snippet = Snippet::full(
             "loudnorm",
             "音量ノーマライズ",
             Some("ffmpeg -i {{input}} -af loudnorm {{output}}"),
@@ -276,10 +269,7 @@ mod tests {
             loaded[0].command.as_deref().unwrap(),
             "ffmpeg -i {{input}} -af loudnorm {{output}}"
         );
-        assert_eq!(
-            loaded[0].tags.as_ref().unwrap(),
-            &vec!["ffmpeg".to_string(), "audio".to_string()]
-        );
+        assert_eq!(loaded[0].tags, vec!["ffmpeg", "audio"]);
         assert!(loaded[0].body.as_ref().unwrap().contains("EBU R128準拠"));
     }
 
@@ -288,9 +278,9 @@ mod tests {
         // Arrange
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
-        let s1 = make_snippet("first", "1番目");
-        let s2 = make_snippet_full("second", "2番目", Some("echo hello"), &["test"], None);
-        let s3 = make_snippet("third", "3番目");
+        let s1 = Snippet::minimal("first", "1番目");
+        let s2 = Snippet::full("second", "2番目", Some("echo hello"), &["test"], None);
+        let s3 = Snippet::minimal("third", "3番目");
 
         // Act
         append_snippet_to(&s1, path).unwrap();
@@ -337,13 +327,12 @@ mod tests {
         // Arrange
         let tmp = NamedTempFile::new().unwrap();
         let path = tmp.path();
-        let existing =
-            make_snippet_full("original", "元のエントリ", Some("echo hi"), &["test"], None);
+        let existing = Snippet::full("original", "元のエントリ", Some("echo hi"), &["test"], None);
         append_snippet_to(&existing, path).unwrap();
         let before = load_snippets_from(path).unwrap();
 
         // Act
-        let new_entry = make_snippet("added", "追加エントリ");
+        let new_entry = Snippet::minimal("added", "追加エントリ");
         append_snippet_to(&new_entry, path).unwrap();
         let after = load_snippets_from(path).unwrap();
 
@@ -364,7 +353,7 @@ mod tests {
         fs::write(path, initial_content).unwrap();
 
         // Act
-        let snippet = make_snippet("second", "追加分");
+        let snippet = Snippet::minimal("second", "追加分");
         append_snippet_to(&snippet, path).unwrap();
         let raw = fs::read_to_string(path).unwrap();
 
